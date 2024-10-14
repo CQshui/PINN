@@ -11,7 +11,7 @@ import torch.optim as optim
 import math
 import torch.nn.functional as F
 from dataset import ImageDataset
-from complexcnn.modules import ComplexConv
+from complexcnn.modules import ComplexConv, ComplexConvTranspose
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from collections import defaultdict
@@ -24,26 +24,26 @@ class PINNFocusNet(nn.Module):
         super(PINNFocusNet, self).__init__()
         # 共享的特征提取层
         self.shared_layers = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=3, padding=1),
+            ComplexConv(1, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            ComplexConv(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            ComplexConv(64, 128, kernel_size=3, padding=1),
             nn.ReLU()
         )
         # 深度预测分支
         self.depth_branch = nn.Sequential(
-            nn.Linear(256 * 64 * 64, 1024),
+            nn.Linear(2 * 128 * 64 * 64, 1024),
             nn.ReLU(),
             nn.Linear(1024, 1)  # 预测z轴深度
         )
         # 图像重建分支
         self.image_branch = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, kernel_size=3, padding=1),
+            ComplexConvTranspose(128, 64, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=3, padding=1),
+            ComplexConvTranspose(64, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.ConvTranspose2d(64, 1, kernel_size=3, padding=1)
+            ComplexConvTranspose(32, 1, kernel_size=3, padding=1)
         )
 
     def forward(self, x):
@@ -56,9 +56,18 @@ class PINNFocusNet(nn.Module):
         z_pred = self.depth_branch(shared_flattened)
 
         # 重建聚焦图像
-        image_pred = self.image_branch(shared_features)
+        image_output = self.image_branch(shared_features)  #  形状为 [4, 2, 1, 128, 128]
+        # 提取实部和虚部
+        real_part = image_output[:, 0, :, :, :]  #  形状为 [4, 1, 128, 128]
+        imag_part = image_output[:, 1, :, :, :]  #  形状为 [4, 1, 128, 128]
 
-        return z_pred, image_pred
+        # 计算平方和
+        magnitude = torch.sqrt(real_part ** 2 + imag_part ** 2)
+
+        # 将结果重新组合成新的 tensor，形状为 [4, 1, 1, 128, 128]
+        image_pred = magnitude.unsqueeze(1)
+
+        return z_pred, image_pred, image_output
 
 
 class MetricMonitor:
@@ -112,40 +121,73 @@ def calc_learning_rate(epoch, init_lr, n_epochs, batch=0, nBatch=None, lr_schedu
 def fresnel_propagation(I_focus, z, wavelength=532e-9, pixel_size=0.098e-6):
     """
     通过菲涅耳衍射将聚焦图像传播到z平面
-    :param I_focus: 聚焦图像
-    :param z: 传播距离
+    :param I_focus: 聚焦图像，形状为 [4, 2, 1, 128, 128]
+    :param z: 传播距离，形状为 [4, 1]
     :param wavelength: 光波波长
     :param pixel_size: 像素大小
-    :return: 在z平面传播后的全息图
+    :return: 在z平面传播后的全息图，形状为 [4, 2, 1, 128, 128]
     """
     N, M = I_focus.shape[-2:]
     fx = torch.fft.fftfreq(N, pixel_size).to(device)
     fy = torch.fft.fftfreq(M, pixel_size).to(device)
     FX, FY = torch.meshgrid(fx, fy)
     pi = torch.tensor(math.pi).to(device)
-    H = torch.exp(1j * 2 * pi * z / wavelength * (FX ** 2 + FY ** 2) ** 0.5).to(device)
-    I_focus_spectrum = torch.fft.fft2(I_focus).to(device)
-    I_propagated_spectrum = I_focus_spectrum * H
-    I_propagated = torch.fft.ifft2(I_propagated_spectrum).to(device)
 
-    return torch.abs(I_propagated)
+    # 将 z 广播到与 I_focus 相同的形状
+    z = z.view(-1, 1, 1, 1, 1)  # 形状为 [4, 1, 1, 1, 1]
+
+    # 计算传递函数 H
+    H = torch.exp(1j * 2 * pi * z / wavelength * (FX ** 2 + FY ** 2) ** 0.5).to(device)
+
+    # 提取 I_focus 的实部和虚部
+    real_part = I_focus[:, 0, :, :, :].unsqueeze(1)  # 形状为 [4, 1, 1, 128, 128]
+    imag_part = I_focus[:, 1, :, :, :].unsqueeze(1)  # 形状为 [4, 1, 1, 128, 128]
+
+    # 将实部和虚部合成为复数场
+    I_focus_complex = torch.complex(real_part, imag_part)
+
+    # 计算 I_focus 的频谱
+    I_focus_spectrum = torch.fft.fft2(I_focus_complex)
+
+    # 计算传播后的频谱
+    I_propagated_spectrum = I_focus_spectrum * H
+
+    # 计算传播后的图像
+    I_propagated = torch.fft.ifft2(I_propagated_spectrum)
+
+    # 将复数结果分解为实部和虚部
+    I_propagated_real = I_propagated.real
+    I_propagated_imag = I_propagated.imag
+
+    # 将实部和虚部重新组合为双通道浮点格式
+    I_propagated_out = torch.cat((I_propagated_real, I_propagated_imag), dim=1)
+
+    return I_propagated_out
 
 
 # 定义损失函数：结合数据损失与物理残差
-def loss_function(z_pred, z_true, image_pred, image_true, hologram, alpha=1.0, beta=1.0, gamma=1.0):
+def loss_function(z_pred, z_true, image_pred, image_true, hologram, reconstruction_complex, alpha=1.0, beta=1.0, gamma=1.0):
     # 深度预测损失
-    depth_loss = torch.mean((z_pred - z_true) ** 2)  # 仍然使用MSE
+    depth_loss = torch.mean((z_pred - z_true*1e5) ** 2)  # 使用MSE
+    # print(z_pred.item(), 1e5*z_true.item(), depth_loss.item())
+    # print('depth_loss: ', depth_loss)
 
-    # 图像重建损失：使用交叉熵损失
-    image_loss = F.cross_entropy(image_pred, image_true)  # 交叉熵损失
+    # 图像重建损失：使用均方误差损失
+    # print(image_pred.shape, image_true.shape)
+    image_loss = F.mse_loss(image_pred, image_true)  # 使用MSE损失
+    # print('image_loss: ', image_loss)
 
     # 物理残差损失：通过菲涅耳衍射将重建图像传播回全息图
-    propagated_hologram = fresnel_propagation(image_pred, z_pred)
-    # physical_residual = torch.mean((propagated_hologram - hologram) ** 2)
-    physical_residual = F.cross_entropy(propagated_hologram, hologram)
+    # print(hologram.shape, reconstruction_complex.shape, z_pred.shape)
+    propagated_hologram = fresnel_propagation(reconstruction_complex, z_pred/1e5)
+    # print('propagated_hologram_shape: ', propagated_hologram.shape)
+    physical_residual = F.mse_loss(propagated_hologram, hologram)  # 使用MSE损失
+    # print('physical_residual: ', physical_residual)
 
     # 总损失
     total_loss = alpha * depth_loss + beta * image_loss + gamma * physical_residual
+    print(depth_loss.item(), image_loss.item(), physical_residual.item())
+    # total_loss = alpha * depth_loss + beta * image_loss
     return total_loss
 
 
@@ -156,12 +198,12 @@ def train(train_loader, model, optimizer, epoch):
     stream = tqdm(train_loader)
     for i, (holograms, reconstructions, zs) in enumerate(stream, start=1):  # 开始训练
         hologram = holograms.to(device, non_blocking=True)  # 加载数据
-        reconstruction = reconstructions.to(device, non_blocking=True)  # 加载模型
-        z = zs.to(device, non_blocking=True)
+        reconstruction_true = reconstructions.to(device, non_blocking=True)  # 加载模型
+        z_true = zs.unsqueeze(1).to(device, non_blocking=True)  # 形状为torch.size([4, 1])
 
-        output = model(hologram)  # 数据送入模型进行前向传播 todo 输入的量都是单张图像还是一个batch？
-        z_pred, reconstruction_pred = output
-        loss = loss_function(z_pred, z, reconstruction_pred, reconstruction, hologram)
+        output = model(hologram)  # 数据送入模型进行前向传播 输入一个batch
+        z_pred, reconstruction_pred, reconstruction_complex = output
+        loss = loss_function(z_pred, z_true, reconstruction_pred, reconstruction_true, hologram, reconstruction_complex)
 
         # loss = criterion(output, target.long())  # 计算损失
         # f1_macro = calculate_f1_macro(output, target)  # 计算f1分数
@@ -180,6 +222,9 @@ def train(train_loader, model, optimizer, epoch):
                 epoch=epoch,
                 metric_monitor=metric_monitor)
         )
+        # 输出当前和最大内存使用情况
+        # print(f"Current memory allocated: {torch.cuda.memory_allocated() / 1024 ** 2} MB")
+        # print(f"Max memory allocated: {torch.cuda.max_memory_allocated() / 1024 ** 2} MB")
     return metric_monitor.metrics['Loss']["avg"]  # 返回结果
 
 
@@ -190,12 +235,12 @@ def validate(val_loader, model, epoch):
     with torch.no_grad():  # 开始推理
         for i, (holograms, reconstructions, zs) in enumerate(stream, start=1):  # 开始训练
             hologram = holograms.to(device, non_blocking=True)  # 加载数据
-            reconstruction = reconstructions.to(device, non_blocking=True)  # 加载模型
-            z = zs.to(device, non_blocking=True)
+            reconstruction_true = reconstructions.to(device, non_blocking=True)  # 加载模型
+            z_true = zs.unsqueeze(1).to(device, non_blocking=True)
 
-            output = model(hologram)  # 数据送入模型进行前向传播 todo 输入的量都是单张图像还是一个batch？
-            z_pred, reconstruction_pred = output
-            loss = loss_function(z_pred, z, reconstruction_pred, reconstruction, hologram)
+            output = model(hologram)  # 数据送入模型进行前向传播
+            z_pred, reconstruction_pred, reconstruction_complex = output
+            loss = loss_function(z_pred, z_true, reconstruction_pred, reconstruction_true, hologram, reconstruction_complex)
 
             # loss = criterion(output, target.long())  # 计算损失
             # f1_macro = calculate_f1_macro(output, target)  # 计算f1分数
@@ -215,9 +260,9 @@ def validate(val_loader, model, epoch):
 
 if __name__ == "__main__":
     # 初始化网络和优化器
-    batch_size = 4
+    batch_size = 1
     epochs = 10
-    lr = 0.0001
+    lr = 0.00001
     model = PINNFocusNet().to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
@@ -232,11 +277,6 @@ if __name__ == "__main__":
     val_loader = DataLoader(  # 按照批次加载验证集
         valid_dataset, batch_size=batch_size, shuffle=False, num_workers=0,
     )
-
-
-    # hologram = torch.randn(1, 1, 64, 64).to(device)  # 输入全息图
-    # z_true = torch.tensor([0.01]).to(device)  # 真实z轴深度
-    # image_true = torch.randn(1, 1, 64, 64).to(device)  # 真实聚焦图像
 
     # 训练循环
     for epoch in range(epochs):

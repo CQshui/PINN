@@ -75,9 +75,10 @@ class ImageDataset(Dataset):
         # # TODO transform的形式需要重新写。
         # if self.transform:
         hologram_splited = torch.tensor(hologram_splited, dtype=torch.float32).unsqueeze(1).to(self.device)
-        hologram_splited = F.interpolate(hologram_splited, size=(128, 128), mode='bilinear', align_corners=False)
+        hologram_splited = F.interpolate(hologram_splited, size=(64, 64), mode='bilinear', align_corners=False)
+
         reconstruction = torch.tensor(reconstruction, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(self.device)
-        reconstruction = F.interpolate(reconstruction, size=(128, 128), mode='bilinear', align_corners=False)
+        reconstruction = F.interpolate(reconstruction, size=(64, 64), mode='bilinear', align_corners=False)
 
         # print(hologram_splited.shape)
         # print(reconstruction.shape)
