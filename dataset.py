@@ -8,6 +8,7 @@ $ Software: Pycharm
 import os
 import numpy as np
 import torch
+from utils import show_image
 from torch.utils.data import Dataset
 from torchvision import transforms
 import cv2
@@ -25,14 +26,14 @@ class FigToTensor(object):
 
 
 class ImageDataset(Dataset):
-    def __init__(self, root_dir, csv_path, shape=256, augmentation=None, transform=None):
+    def __init__(self, root_dir, csv_path, input_size, augmentation=None, transform=None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.augmentation = augmentation
         self.transform = transform
         self.root_dir = root_dir
         self.hologram_path = os.path.join(self.root_dir, 'hologram')
         self.reconstruction_path = os.path.join(self.root_dir, 'reconstruction')
-        self.shape = shape
+        self.input_size = input_size
         self.csv_path = csv_path
 
         # 读取CSV内容
@@ -75,10 +76,10 @@ class ImageDataset(Dataset):
         # # TODO transform的形式需要重新写。
         # if self.transform:
         hologram_splited = torch.tensor(hologram_splited, dtype=torch.float32).unsqueeze(1).to(self.device)
-        hologram_splited = F.interpolate(hologram_splited, size=(64, 64), mode='bilinear', align_corners=False)
+        hologram_splited = F.interpolate(hologram_splited, size=self.input_size, mode='bilinear', align_corners=False)
 
         reconstruction = torch.tensor(reconstruction, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(self.device)
-        reconstruction = F.interpolate(reconstruction, size=(64, 64), mode='bilinear', align_corners=False)
+        reconstruction = F.interpolate(reconstruction, size=self.input_size, mode='bilinear', align_corners=False)
 
         # print(hologram_splited.shape)
         # print(reconstruction.shape)
@@ -128,10 +129,16 @@ def get_torch_transforms_3channel(img_size=224):
 
 
 if __name__ == '__main__':
+    input_size = (256, 256)
     csv = r'M:\Data\AutoFocusDatabase\AutoFocusDatabase.csv'
-    train_dataset = ImageDataset(r'M:\Data\AutoFocusDatabase\train', csv, transform=None)
+    train_dataset = ImageDataset(r'M:\Data\AutoFocusDatabase\train', csv, input_size, transform=None)
     x = train_dataset[0]
-    print(x)
+    hologram, reconstruction, z = x
+    hologram = hologram.unsqueeze(0)
+    reconstruction = reconstruction.unsqueeze(0)
+
+    show_image(hologram)
+    show_image(reconstruction)
 
     # train_loader = DataLoader(  # 按照批次加载训练集
     #     train_dataset, batch_size=4, shuffle=True,

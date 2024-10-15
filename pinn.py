@@ -5,16 +5,19 @@
 $ File:     pinn.py
 $ Software: Pycharm
 """
+import os
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import math
 import torch.nn.functional as F
 from dataset import ImageDataset
-from complexcnn.modules import ComplexConv, ComplexConvTranspose
+from complexcnn.modules import ComplexConv, ComplexConvTranspose, ComplexMaxPool2d, ComplexUpsample
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from collections import defaultdict
+from utils import accuracy
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -22,29 +25,55 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 class PINNFocusNet(nn.Module):
     def __init__(self):
         super(PINNFocusNet, self).__init__()
+        self.input_size = input_size
+
         # 共享的特征提取层
         self.shared_layers = nn.Sequential(
-            ComplexConv(1, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            ComplexConv(32, 64, kernel_size=3, padding=1),
+            ComplexConv(1, 64, kernel_size=3, padding=1),
+            ComplexMaxPool2d(kernel_size=2, stride=2),
             nn.ReLU(),
             ComplexConv(64, 128, kernel_size=3, padding=1),
+            ComplexMaxPool2d(kernel_size=2, stride=2),
+            nn.ReLU(),
+            ComplexConv(128, 256, kernel_size=3, padding=1),
+            ComplexMaxPool2d(kernel_size=2, stride=2),
             nn.ReLU()
         )
+
+        # 计算特征提取层的输出尺寸
+        self.output_size = self._calculate_output_size(input_size)
+        self.flattened_size = 2 * 256 * self.output_size[0] * self.output_size[1]
+
         # 深度预测分支
         self.depth_branch = nn.Sequential(
-            nn.Linear(2 * 128 * 64 * 64, 1024),
+            nn.Linear(self.flattened_size, 1024),
             nn.ReLU(),
             nn.Linear(1024, 1)  # 预测z轴深度
         )
+
         # 图像重建分支
         self.image_branch = nn.Sequential(
+            ComplexConvTranspose(256, 128, kernel_size=3, padding=1),
+            ComplexUpsample(scale_factor=2),
+            nn.ReLU(),
             ComplexConvTranspose(128, 64, kernel_size=3, padding=1),
+            ComplexUpsample(scale_factor=2),
             nn.ReLU(),
             ComplexConvTranspose(64, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
+            ComplexUpsample(scale_factor=2),
             ComplexConvTranspose(32, 1, kernel_size=3, padding=1)
         )
+
+    def _calculate_output_size(self, input_size):
+        # 虚拟输入
+        x = torch.zeros(1, 2, 1, input_size[0], input_size[1])
+
+        # 计算特征提取层的输出尺寸
+        for layer in self.shared_layers:
+            x = layer(x)
+
+        # 返回输出尺寸
+        return x.size()[3:]
 
     def forward(self, x):
         # 共享特征提取
@@ -166,7 +195,7 @@ def fresnel_propagation(I_focus, z, wavelength=532e-9, pixel_size=0.098e-6):
 
 
 # 定义损失函数：结合数据损失与物理残差
-def loss_function(z_pred, z_true, image_pred, image_true, hologram, reconstruction_complex, alpha=1.0, beta=1.0, gamma=1.0):
+def loss_function(z_pred, z_true, reconstruction_pred, reconstruction_true, hologram, propagated_hologram, alpha=1.0, beta=1.0, gamma=1.0):
     # 深度预测损失
     depth_loss = torch.mean((z_pred - z_true*1e5) ** 2)  # 使用MSE
     # print(z_pred.item(), 1e5*z_true.item(), depth_loss.item())
@@ -174,12 +203,12 @@ def loss_function(z_pred, z_true, image_pred, image_true, hologram, reconstructi
 
     # 图像重建损失：使用均方误差损失
     # print(image_pred.shape, image_true.shape)
-    image_loss = F.mse_loss(image_pred, image_true)  # 使用MSE损失
+    image_loss = F.mse_loss(reconstruction_pred, reconstruction_true)  # 使用MSE损失
     # print('image_loss: ', image_loss)
 
-    # 物理残差损失：通过菲涅耳衍射将重建图像传播回全息图
+    # 物理残差损失：通过菲涅耳衍射将重建图像传播回全息图，这两张图都是 复数 形式的
     # print(hologram.shape, reconstruction_complex.shape, z_pred.shape)
-    propagated_hologram = fresnel_propagation(reconstruction_complex, z_pred/1e5)
+    propagated_hologram = fresnel_propagation(propagated_hologram, z_true)
     # print('propagated_hologram_shape: ', propagated_hologram.shape)
     physical_residual = F.mse_loss(propagated_hologram, hologram)  # 使用MSE损失
     # print('physical_residual: ', physical_residual)
@@ -208,11 +237,13 @@ def train(train_loader, model, optimizer, epoch):
         # loss = criterion(output, target.long())  # 计算损失
         # f1_macro = calculate_f1_macro(output, target)  # 计算f1分数
         # recall_macro = calculate_recall_macro(output, target)  # 计算recall分数
-        # acc = accuracy(output, target)  # 计算准确率分数
+        # acc = accuracy(z_pred, z_true, reconstruction_pred, reconstruction_true, hologram, reconstruction_complex)  # 计算准确率
         metric_monitor.update('Loss', loss)  # 更新损失
         # metric_monitor.update('F1', f1_macro)  # 更新f1
         # metric_monitor.update('Recall', recall_macro)  # 更新recall
-        # metric_monitor.update('Accuracy', acc)  # 更新准确率
+        # metric_monitor.update('Accuracy_Z', acc[0])  # 更新准确率
+        # metric_monitor.update('Accuracy_R', acc[1])  # 更新准确率
+        # metric_monitor.update('Accuracy_H', acc[2])  # 更新准确率
         optimizer.zero_grad()  # 清空学习率
         loss.backward()  # 损失反向传播
         optimizer.step()  # 更新优化器
@@ -225,7 +256,7 @@ def train(train_loader, model, optimizer, epoch):
         # 输出当前和最大内存使用情况
         # print(f"Current memory allocated: {torch.cuda.memory_allocated() / 1024 ** 2} MB")
         # print(f"Max memory allocated: {torch.cuda.max_memory_allocated() / 1024 ** 2} MB")
-    return metric_monitor.metrics['Loss']["avg"]  # 返回结果
+    return metric_monitor.metrics['Loss']["avg"]
 
 
 def validate(val_loader, model, epoch):
@@ -245,11 +276,13 @@ def validate(val_loader, model, epoch):
             # loss = criterion(output, target.long())  # 计算损失
             # f1_macro = calculate_f1_macro(output, target)  # 计算f1分数
             # recall_macro = calculate_recall_macro(output, target)  # 计算recall分数
-            # acc = accuracy(output, target)  # 计算准确率分数
+            # acc = accuracy(z_pred, z_true, reconstruction_pred, reconstruction_true, hologram, reconstruction_complex)  # 计算准确率
             metric_monitor.update('Loss', loss)  # 更新损失
             # metric_monitor.update('F1', f1_macro)  # 更新f1
             # metric_monitor.update('Recall', recall_macro)  # 更新recall
-            # metric_monitor.update('Accuracy', acc)  # 更新准确率
+            # metric_monitor.update('Accuracy_Z', acc[0])  # 更新准确率
+            # metric_monitor.update('Accuracy_R', acc[1])  # 更新准确率
+            # metric_monitor.update('Accuracy_H', acc[2])  # 更新准确率
             stream.set_description(  # 更新进度条
                 "Epoch: {epoch}. Validation.      {metric_monitor}".format(
                     epoch=epoch,
@@ -260,16 +293,18 @@ def validate(val_loader, model, epoch):
 
 if __name__ == "__main__":
     # 初始化网络和优化器
-    batch_size = 1
+    batch_size = 4
     epochs = 10
     lr = 0.00001
+    input_size = (128, 128)
+    model_save_path = "./checkpoints"
     model = PINNFocusNet().to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     # 数据驱动
     csv = r'M:\Data\AutoFocusDatabase\AutoFocusDatabase.csv'
-    train_dataset = ImageDataset(r'M:\Data\AutoFocusDatabase\train', csv, transform=None)
-    valid_dataset = ImageDataset(r'M:\Data\AutoFocusDatabase\val', csv, transform=None)
+    train_dataset = ImageDataset(r'M:\Data\AutoFocusDatabase\train', csv, input_size, transform=None)
+    valid_dataset = ImageDataset(r'M:\Data\AutoFocusDatabase\val', csv, input_size, transform=None)
 
     train_loader = DataLoader(  # 按照批次加载训练集
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=0,
@@ -283,3 +318,7 @@ if __name__ == "__main__":
         optimizer.zero_grad()
         train_loss = train(train_loader, model, optimizer, epoch)
         valid_loss = validate(val_loader, model, epoch)
+
+        # 每隔5个epoch保存一次模型
+        if epoch % 1 == 0:
+            torch.save(model.state_dict(), os.path.join(model_save_path, f'model_epoch_{epoch}.pth'))

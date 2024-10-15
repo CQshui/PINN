@@ -8,6 +8,7 @@ $ Software: Pycharm
 import torch
 import torch.nn as nn
 import numpy as np
+import torch.nn.functional as F
 
 
 class ComplexConv(nn.Module):
@@ -44,6 +45,45 @@ class ComplexConvTranspose(nn.Module):
     def forward(self, x):  # shape of x: [batch, 2, channel, axis1, axis2]
         real = self.conv_transpose_re(x[:, 0]) - self.conv_transpose_im(x[:, 1])
         imaginary = self.conv_transpose_re(x[:, 1]) + self.conv_transpose_im(x[:, 0])
+        output = torch.stack((real, imaginary), dim=1)
+        return output
+
+
+class ComplexMaxPool2d(nn.Module):
+    def __init__(self, kernel_size, stride=None, padding=0, dilation=1, return_indices=False, ceil_mode=False):
+        super(ComplexMaxPool2d, self).__init__()
+        self.maxpool_re = nn.MaxPool2d(kernel_size, stride=stride, padding=padding, dilation=dilation, return_indices=return_indices, ceil_mode=ceil_mode)
+        self.maxpool_im = nn.MaxPool2d(kernel_size, stride=stride, padding=padding, dilation=dilation, return_indices=return_indices, ceil_mode=ceil_mode)
+
+    def forward(self, x):  # shape of x: [batch, 2, channel, axis1, axis2]
+        real = self.maxpool_re(x[:, 0])
+        imaginary = self.maxpool_im(x[:, 1])
+        output = torch.stack((real, imaginary), dim=1)
+        return output
+
+
+class ComplexAvgPool2d(nn.Module):
+    def __init__(self, kernel_size, stride=None, padding=0, ceil_mode=False, count_include_pad=True):
+        super(ComplexAvgPool2d, self).__init__()
+        self.avgpool_re = nn.AvgPool2d(kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad)
+        self.avgpool_im = nn.AvgPool2d(kernel_size, stride=stride, padding=padding, ceil_mode=ceil_mode, count_include_pad=count_include_pad)
+
+    def forward(self, x):  # shape of x: [batch, 2, channel, axis1, axis2]
+        real = self.avgpool_re(x[:, 0])
+        imaginary = self.avgpool_im(x[:, 1])
+        output = torch.stack((real, imaginary), dim=1)
+        return output
+
+
+class ComplexUpsample(nn.Module):
+    def __init__(self, scale_factor, mode='bilinear'):
+        super(ComplexUpsample, self).__init__()
+        self.scale_factor = scale_factor
+        self.mode = mode
+
+    def forward(self, x):  # shape of x: [batch, 2, channel, axis1, axis2]
+        real = F.interpolate(x[:, 0], scale_factor=self.scale_factor, mode=self.mode, align_corners=False)
+        imaginary = F.interpolate(x[:, 1], scale_factor=self.scale_factor, mode=self.mode, align_corners=False)
         output = torch.stack((real, imaginary), dim=1)
         return output
 
